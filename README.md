@@ -20,6 +20,6 @@ Then your images directory will be: "D:\YourDir\images_folder"
 How to train:
 
 ```batch
-python train.py --dir D:\YourDir\YourFolder --inf
+python train.py --dir D:\YourDir\YourFolder --n_gpus 1 --im_size 512 --batch_size 8 --inf
 ```
 You can enable conditional training anytime by adding "--cond".
