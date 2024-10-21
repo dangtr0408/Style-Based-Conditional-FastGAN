@@ -6,15 +6,19 @@ What's new:
 - Switch to pytorch DDP.
 
 Before training make sure your image folders are as following format:
+
+```
 images_folder
 ├── cat_images (class1)
 ├── dog_images (class2)
 └── cat_images (class1)
+```
+
 Then your images dir will be: D:\YourDir\images_folder
 
 How to train:
 
 ```batch
-python train.py --dir --inf
+python train.py --dir D:\YourDir\YourFolder --inf
 ```
 You can enable conditional training anytime by adding "--cond".
