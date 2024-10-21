@@ -27,14 +27,14 @@ from utils import *
 
 parser = argparse.ArgumentParser(description="Process some integers.")
 
-parser.add_argument('--dir', type=str, help='Directory path', default='../../Data/fast_gan_few_shot_images/anime-face')
+parser.add_argument('--dir', type=str, help='Directory path')
 parser.add_argument('--n_workers', type=int, help='Number of workers', default='3')
-parser.add_argument('--master', type=int, help='Master GPU', default='1')
-parser.add_argument('--n_gpus', type=int, help='Number of GPUs', default='2')
+parser.add_argument('--master', type=int, help='Master GPU', default='0')
+parser.add_argument('--n_gpus', type=int, help='Number of GPUs', default='1')
 
 parser.add_argument('--z_dim', type=int, help='Latent size', default='512')
 parser.add_argument('--im_size', type=int, help='Output images size', default='512')
-parser.add_argument('--batch_size', type=int, help='Batch size for each GPU', default='10')
+parser.add_argument('--batch_size', type=int, help='Batch size for each GPU', default='8')
 parser.add_argument('--epoch', type=int, help='Number of epochs', default='800')
 parser.add_argument('--gen_lr', type=float, help='Generator learning rate', default='2e-4')
 parser.add_argument('--disc_lr', type=float, help='Discriminator learning rate', default='2e-4')
@@ -157,7 +157,7 @@ def train_fn(critic, gen, gen_ema, percept,
         update_average(gen_ema, gen, ema_decay)
 
         if config.INF_SAMPLER:
-            if config.DEVICE == config.MASTER_DEVICE and batch_idx % 1000 == 0:
+            if config.DEVICE == config.MASTER_DEVICE and batch_idx % config.SNAP_ITER == 0:
                 true_params = get_copy_params(gen)
                 update_average(gen, gen_ema, beta=0)#swap true params to avg params
                 generate_examples(gen, batch_idx, seed=482002, batch_size=8, nrow=4, cus_name=f'img_{batch_idx}', dir='./saved_images/')
