@@ -5,7 +5,7 @@ What's new:
 - Added conditional training by modifying the SLE layers.
 - Switched to PyTorch DDP.
 
-Before training make sure your image folders are as following format:
+Before training make sure your image folders are in the following format:
 
 ```
 images_folder
