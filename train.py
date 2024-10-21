@@ -1,205 +1,346 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+import os
+from tqdm import tqdm
+#from tqdm import tqdm_notebook as tqdm
+from collections import OrderedDict
+import argparse
+
 import torch
-from torch import nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data.dataloader import DataLoader
-from torchvision import transforms
-from torchvision import utils as vutils
-
-import argparse
-import random
-from tqdm import tqdm
-
-from models import weights_init, Discriminator, Generator
-from operation import copy_G_params, load_params, get_dir
-from operation import ImageFolder, InfiniteSamplerWrapper
+from torchvision.utils import save_image
 from diffaug import DiffAugment
-policy = 'color,translation'
 import lpips
-percept = lpips.PerceptualLoss(model='net-lin', net='vgg', use_gpu=True)
+from copy import deepcopy
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from multiprocessing import current_process
 
-#torch.backends.cudnn.benchmark = True
+import config
+from models import Generator, Discriminator
+from dataloader import DATASET, Multi_DataLoader
+from utils import *
 
-def crop_image_by_part(image, part):
-    hw = image.shape[2]//2
-    if part==0:
-        return image[:,:,:hw,:hw]
-    if part==1:
-        return image[:,:,:hw,hw:]
-    if part==2:
-        return image[:,:,hw:,:hw]
-    if part==3:
-        return image[:,:,hw:,hw:]
+parser = argparse.ArgumentParser(description="Process some integers.")
 
-def train_d(net, data, label="real"):
-    """Train function of discriminator"""
-    if label=="real":
-        part = random.randint(0, 3)
-        pred, [rec_all, rec_small, rec_part] = net(data, label, part=part)
-        err = F.relu(  torch.rand_like(pred) * 0.2 + 0.8 -  pred).mean() + \
-            percept( rec_all, F.interpolate(data, rec_all.shape[2]) ).sum() +\
-            percept( rec_small, F.interpolate(data, rec_small.shape[2]) ).sum() +\
-            percept( rec_part, F.interpolate(crop_image_by_part(data, part), rec_part.shape[2]) ).sum()
-        err.backward()
-        return pred.mean().item(), rec_all, rec_small, rec_part
+parser.add_argument('--dir', type=str, help='Directory path', default='../../Data/fast_gan_few_shot_images/anime-face')
+parser.add_argument('--n_workers', type=int, help='Number of workers', default='3')
+parser.add_argument('--master', type=int, help='Master GPU', default='1')
+parser.add_argument('--n_gpus', type=int, help='Number of GPUs', default='2')
+
+parser.add_argument('--z_dim', type=int, help='Latent size', default='512')
+parser.add_argument('--im_size', type=int, help='Output images size', default='512')
+parser.add_argument('--batch_size', type=int, help='Batch size for each GPU', default='10')
+parser.add_argument('--epoch', type=int, help='Number of epochs', default='800')
+parser.add_argument('--gen_lr', type=float, help='Generator learning rate', default='2e-4')
+parser.add_argument('--disc_lr', type=float, help='Discriminator learning rate', default='2e-4')
+parser.add_argument('--disc_update', type=int, help='Update discriminator more', default='1')
+parser.add_argument('--cond', action='store_true', help='Start conditional training')
+
+parser.add_argument('--snap', type=int, help='Number of batches before save the weights. This option will overwrite old "checkpoint_fastgan.pt"', default='200')
+parser.add_argument('--snap_epoch', type=int, help='Number of epochs before save the weights. This option will create new saved file called "checkpoint_fastgan_epoch_n.pt"', default='2')
+parser.add_argument('--snap_iter', type=int, help='Use with inf_sampler. Save a new file in format "checkpoint_fastgan_iter_n.pt"', default='5000')
+parser.add_argument('--inf', action='store_true', help='No epoch! Just training. Recommend for small dataset. Use snap_iter to save weights.')#Note that using this option will not resample the undersampling classes. Check line "loader = Multi_DataLoader"
+parser.add_argument('--start_iter', type=int, help='Use with inf_sampler. Continue at iter n.', default='0')
+
+args = parser.parse_args()
+
+config.DEVICE = None
+config.MASTER_DEVICE = args.master
+config.IMG_SIZE = args.im_size
+config.Z_DIM = args.z_dim
+config.BATCH_SIZE = args.batch_size
+config.LEARNING_RATE_GENERATOR = args.gen_lr
+config.LEARNING_RATE_CRITIC = args.disc_lr
+config.NUM_WORKERS = args.n_workers
+config.NUM_EPOCHS = args.epoch
+config.NUM_GPU = args.n_gpus
+config.DISC_UPDATE = args.disc_update
+config.SAVE_MODEL = True
+config.SNAP = args.snap
+config.SNAP_EPOCH = args.snap_epoch
+config.SNAP_ITER = args.snap_iter
+config.CONDITIONAL_TRAINING = args.cond
+config.INF_SAMPLER = args.inf
+
+#Setup multi GPUs
+
+def Multi_GPU_Setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '1245'
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    #dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+#--------------------TRAIN FUNCTION--------------------
+
+def train_fn(critic, gen, gen_ema, percept,
+             loader, policy,
+             opt_critic, opt_gen,
+             total_images_processed, epoch,
+             blur_init_sigma=1, blur_fade_kimg=20, 
+             n_critic_updates=2, lazy_reg=16, ema_decay=0.999):
+    current = current_process()
+    loop = tqdm(loader, leave=True, position=current._identity[0] - 1, initial=args.start_iter)
+    cum_loss_critic = 0
+    cum_loss_gen = 0
+
+    for batch_idx, (real, c) in enumerate(loop):
+        batch_idx += args.start_iter
+
+        real = real.to(config.DEVICE)
+        c = c.to(config.DEVICE)
+        cur_batch_size = real.shape[0]
+        total_images_processed += cur_batch_size
+        blur_sigma = max(1 - total_images_processed / (blur_fade_kimg * 1e3), 0) * blur_init_sigma if blur_fade_kimg > 1 else 0
+
+        #Train critic
+        critic.zero_grad()
+        for i in range(n_critic_updates):
+            if i+1 == n_critic_updates:#last loop for generator update
+                noise = get_noise()
+                fake  = gen(noise, c)
+            else:
+                with torch.no_grad():
+                    noise = get_noise()
+                    fake  = gen(noise, c)         
+            fake_image    = DiffAugment(fake, types=policy)
+            real_image    = DiffAugment(real, types=policy)
+
+            #Fake
+            critic_fake = critic(blur_schedule(fake_image.detach(), blur_sigma), c)#
+            loss_critic_fake = (F.relu(torch.ones_like(critic_fake) + critic_fake)).mean()
+            loss_critic_fake.backward()
+            
+            if batch_idx % lazy_reg == 0 and i+1 == n_critic_updates:
+                real_image.requires_grad_()
+
+            #Real
+            critic_real, part, [rec_all, rec_part] = critic(blur_schedule(real_image, blur_sigma), c, get_aux=True)#
+            real_lowres = F.interpolate(real_image, rec_all.shape[2])
+            real_lowres_crop = F.interpolate(crop_image_by_part(real_image, part), rec_part.shape[2])
+
+            #Gradient penalty
+            if batch_idx % lazy_reg == 0 and i+1 == n_critic_updates:
+                gradients, *_ = torch.autograd.grad(outputs=critic_real,
+                                                    inputs=real_image,
+                                                    grad_outputs=critic_real.new_ones(critic_real.shape),
+                                                    create_graph=True)
+                gradients = gradients.reshape(cur_batch_size, -1)
+                norm = gradients.norm(2, dim=-1)
+                gradient_penalty = torch.mean(norm ** 2)
+            else: gradient_penalty = 0
+
+            mse_loss = torch.nn.MSELoss()
+            loss_critic_real =  (F.relu(torch.ones_like(critic_real) - critic_real)).mean()                                 +\
+                                mse_loss(rec_all, real_lowres).sum()                                                        +\
+                                mse_loss(rec_part, real_lowres_crop).sum()                                                  +\
+                                percept(rec_all, real_lowres).sum()                                                         +\
+                                percept(rec_part, real_lowres_crop).sum()                                                   +\
+                                gradient_penalty                                                                          *4
+                                                                                                 
+            loss_critic_real.backward()
+            opt_critic.step()
+
+        #Train gen
+        critic_fake = critic(blur_schedule(fake_image, blur_sigma), c)#
+        loss_gen =  -torch.mean(critic_fake)
+        loss_gen.backward()
+        torch.nn.utils.clip_grad_norm_(gen.parameters(), max_norm=10.)
+        opt_gen.step()
+        gen.zero_grad()
+
+        #Update gen_ema
+        update_average(gen_ema, gen, ema_decay)
+
+        if config.INF_SAMPLER:
+            if config.DEVICE == config.MASTER_DEVICE and batch_idx % 1000 == 0:
+                true_params = get_copy_params(gen)
+                update_average(gen, gen_ema, beta=0)#swap true params to avg params
+                generate_examples(gen, batch_idx, seed=482002, batch_size=8, nrow=4, cus_name=f'img_{batch_idx}', dir='./saved_images/')
+                save_image( torch.cat([
+                            F.interpolate(real_image, rec_all.shape[-1]),
+                            rec_all,
+                            rec_part], dim=2)[:8].add(1).mul(0.5),
+                            f'./saved_recs/rec_{batch_idx}.jpg')
+                load_params(gen, true_params)#back to true params
+            if config.DEVICE == config.MASTER_DEVICE and config.SAVE_MODEL and batch_idx % config.SNAP_ITER == 0 and batch_idx != 0:
+                checkpoint = {
+                        'epoch': epoch-1,
+                        'gen_ema': gen_ema.state_dict(),
+                        'gen': gen.state_dict(),
+                        'critic':critic.state_dict(),
+                        'opt_gen': opt_gen.state_dict(),
+                        'opt_critic': opt_critic.state_dict(),
+                    }
+                torch.save(checkpoint, f'./saved_model_weights/checkpoint_fastgan_iter_{batch_idx}.pt')
+        else:
+            if config.DEVICE == config.MASTER_DEVICE and batch_idx % 100 == 0:
+                generate_examples(gen, batch_idx, n=16)
+                save_image( torch.cat([
+                            F.interpolate(real_image, rec_all.shape[-1]),
+                            rec_all,
+                            rec_part], dim=2)[:8].add(1).mul(0.5),
+                            f'./saved_recs/rec_{batch_idx}.jpg')
+        if config.DEVICE == config.MASTER_DEVICE and config.SAVE_MODEL and (batch_idx+1) % config.SNAP == 0:
+            checkpoint = {
+                    'epoch': epoch-1,
+                    'gen_ema': gen_ema.state_dict(),
+                    'gen': gen.state_dict(),
+                    'critic':critic.state_dict(),
+                    'opt_gen': opt_gen.state_dict(),
+                    'opt_critic': opt_critic.state_dict(),
+                }
+            torch.save(checkpoint, './saved_model_weights/checkpoint_fastgan.pt')
+
+        loss_critic = loss_critic_fake + loss_critic_real
+        cum_loss_critic     += loss_critic.item()
+        cum_loss_gen        += loss_gen.item()
+        loop.set_postfix(
+            l_critic=cum_loss_critic/(batch_idx+1),
+            l_gen   =cum_loss_gen/(batch_idx+1),
+        )
+
+#--------------------MAIN--------------------
+
+def main(rank, world_size):
+    config.DEVICE = rank
+    print(f"Rank: {config.DEVICE}, Name: {torch.cuda.get_device_name(config.DEVICE)}")
+    if config.DEVICE == config.MASTER_DEVICE: print(f"Master device: {torch.cuda.get_device_name(config.DEVICE)}")
+    Multi_GPU_Setup(rank=rank, world_size=world_size)
+
+    data = DATASET(directory=args.dir, augment=True)
+
+    num_classes = data.get_num_classes()
+    data_size   = data.__len__()
+
+    gen                 = Generator(num_classes, ngf=64, nz=config.Z_DIM, im_size=config.IMG_SIZE, cond_training=config.CONDITIONAL_TRAINING).to(config.DEVICE)
+    critic              = Discriminator(num_classes, ndf=64, nz=config.Z_DIM, im_size=config.IMG_SIZE).to(config.DEVICE)
+    
+    #diff lr for mapping network
+    parameters = []
+    match_name = ['mapping_network','mapping']
+    for idx, (name, param) in enumerate(gen.named_parameters()):
+        if param.requires_grad:
+            if name.split(".")[0] in match_name:
+                #print(f"found {name}")
+                parameters += [{'params': [param], 'lr': 0.001}]
+            else: parameters += [{'params': [param]}]
+    # for idx, (name, param) in enumerate(critic.named_parameters()):
+    #     if param.requires_grad:
+    #         if name.split(".")[0] in match_name:
+    #             #print(f"found {name}")
+    #             parameters += [{'params': [param], 'lr': 0.001}]
+    #         else: parameters += [{'params': [param]}]
+
+    opt_gen             = optim.Adam(gen.parameters(), lr=config.LEARNING_RATE_GENERATOR, betas=(0.5, 0.99), eps=1e-8)
+    opt_critic          = optim.Adam(critic.parameters(), lr=config.LEARNING_RATE_CRITIC, betas=(0.5, 0.99), eps=1e-8)
+    percept = lpips.LPIPS(net='vgg').to(config.DEVICE)
+    policy = ['color', 'offset_h', 'cutout', 'translation']
+
+    gen     = DDP(gen, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+    critic  = DDP(critic, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+    
+    gen_ema = deepcopy(gen)
+    # initialize the gen_ema weights equal to the weights of gen
+    update_average(gen_ema, gen, beta=0)
+
+    load_epoch = 0
+    dir = './saved_model_weights/checkpoint_fastgan.pt'
+    if os.path.exists(dir):
+        checkpoint = torch.load(dir, map_location="cpu")
+        # Add "module" prefix for non-ddp saved files
+        model_dict = {'gen':OrderedDict(),'gen_ema':OrderedDict(),'critic':OrderedDict()}
+        for key in checkpoint.keys():
+            if key in ['gen', 'gen_ema', 'critic']:
+                for k,v in checkpoint[key].items():
+                    if not k.startswith('module.'):
+                        new_key = 'module.' + k
+                        model_dict[key][new_key] = v
+                    else:
+                        model_dict[key][k] = v
+        gen.load_state_dict(model_dict['gen'], strict=False)
+        gen_ema.load_state_dict(model_dict['gen_ema'], strict=False)
+        critic.load_state_dict(model_dict['critic'], strict=False)
+        load_epoch = checkpoint['epoch']
+        opt_gen.load_state_dict(checkpoint['opt_gen'])
+        opt_critic.load_state_dict(checkpoint['opt_critic'])
+        del checkpoint
+        del model_dict
+        torch.cuda.empty_cache()
     else:
-        pred = net(data, label)
-        err = F.relu( torch.rand_like(pred) * 0.2 + 0.8 + pred).mean()
-        err.backward()
-        return pred.mean().item()
-        
+        if config.DEVICE == config.MASTER_DEVICE: print(f"\nThere is no saved file at {dir}. Start training a new model...")
 
-def train(args):
+    gen.train()
+    gen_ema.train()
+    critic.train()
 
-    data_root = args.path
-    total_iterations = args.iter
-    checkpoint = args.ckpt
-    batch_size = args.batch_size
-    im_size = args.im_size
-    ndf = 64
-    ngf = 64
-    nz = 256
-    nlr = 0.0002
-    nbeta1 = 0.5
-    use_cuda = True
-    multi_gpu = True
-    dataloader_workers = args.workers
-    current_iteration = args.start_iter
-    save_interval = args.save_interval
-    saved_model_folder, saved_image_folder = get_dir(args)
+    if config.DEVICE == config.MASTER_DEVICE:
+        gen_total_params = sum(p.numel() for p in gen.parameters())
+        critic_total_params = sum(p.numel() for p in critic.parameters())
+        print("\n")
+        print(f"Gen parameters: {gen_total_params}")
+        print(f"Critic parameters: {critic_total_params}")
+        print("\n")
 
-    
-    device = torch.device("cpu")
-    if use_cuda:
-        device = torch.device("cuda:0")
+    for epoch in range(load_epoch+1, config.NUM_EPOCHS):
+        if config.DEVICE == config.MASTER_DEVICE: print(f"\nEpoch: {epoch}")
+        # re-sample for under-sampling classes
+        loader = Multi_DataLoader(data, rank=rank, world_size=world_size, batch_size=config.BATCH_SIZE, num_workers=config.NUM_WORKERS, shuffle=True)
+        if not config.INF_SAMPLER:
+            loader.sampler.set_epoch(epoch)
+        total_images_processed = (epoch-1)*data_size
 
-    transform_list = [
-            transforms.Resize((int(im_size),int(im_size))),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ]
-    trans = transforms.Compose(transform_list)
-    
-    if 'lmdb' in data_root:
-        from operation import MultiResolutionDataset
-        dataset = MultiResolutionDataset(data_root, trans, 1024)
-    else:
-        dataset = ImageFolder(root=data_root, transform=trans)
+        train_fn(critic, gen, gen_ema, percept,
+                loader, policy,
+                opt_critic, opt_gen,
+                total_images_processed, epoch, 
+                n_critic_updates=config.DISC_UPDATE)
+        # Gen examples
+        if config.DEVICE == config.MASTER_DEVICE:
+            true_params = get_copy_params(gen)
+            update_average(gen, gen_ema, beta=0)#swap true params to avg params
+            for i in range(num_classes):
+                generate_examples(gen, epoch, dir=f"./saved_epoch_images/{data.class_names[i]}", c_in=i, batch_size=8, nrow=4, seed=482002, isEpoch=True, cus_name=f"{data.class_names[i]}_{epoch}")
+            load_params(gen, true_params)#back to true params
+        # Save model
+        if config.DEVICE == config.MASTER_DEVICE and config.SAVE_MODEL:
+            checkpoint = {
+                'epoch': epoch,
+                'gen_ema': gen_ema.state_dict(),
+                'gen': gen.state_dict(),
+                'critic':critic.state_dict(),
+                'opt_gen': opt_gen.state_dict(),
+                'opt_critic': opt_critic.state_dict(),
+            }
+            torch.save(checkpoint, './saved_model_weights/checkpoint_fastgan.pt')
+            #Backup
+            if epoch % config.SNAP_EPOCH == 0: 
+                torch.save(checkpoint, f'./saved_model_weights/checkpoint_fastgan_epoch_{epoch}.pt')
 
-   
-    dataloader = iter(DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                      sampler=InfiniteSamplerWrapper(dataset), num_workers=dataloader_workers, pin_memory=True))
-    '''
-    loader = MultiEpochsDataLoader(dataset, batch_size=batch_size, 
-                               shuffle=True, num_workers=dataloader_workers, 
-                               pin_memory=True)
-    dataloader = CudaDataLoader(loader, 'cuda')
-    '''
-    
-    
-    #from model_s import Generator, Discriminator
-    netG = Generator(ngf=ngf, nz=nz, im_size=im_size)
-    netG.apply(weights_init)
 
-    netD = Discriminator(ndf=ndf, im_size=im_size)
-    netD.apply(weights_init)
 
-    netG.to(device)
-    netD.to(device)
 
-    avg_param_G = copy_G_params(netG)
 
-    fixed_noise = torch.FloatTensor(8, nz).normal_(0, 1).to(device)
-    
-    optimizerG = optim.Adam(netG.parameters(), lr=nlr, betas=(nbeta1, 0.999))
-    optimizerD = optim.Adam(netD.parameters(), lr=nlr, betas=(nbeta1, 0.999))
 
-    if checkpoint != 'None':
-        ckpt = torch.load(checkpoint)
-        netG.load_state_dict({k.replace('module.', ''): v for k, v in ckpt['g'].items()})
-        netD.load_state_dict({k.replace('module.', ''): v for k, v in ckpt['d'].items()})
-        avg_param_G = ckpt['g_ema']
-        optimizerG.load_state_dict(ckpt['opt_g'])
-        optimizerD.load_state_dict(ckpt['opt_d'])
-        current_iteration = int(checkpoint.split('_')[-1].split('.')[0])
-        del ckpt
-        
-    if multi_gpu:
-        netG = nn.DataParallel(netG.to(device))
-        netD = nn.DataParallel(netD.to(device))
-    
-    for iteration in tqdm(range(current_iteration, total_iterations+1)):
-        real_image = next(dataloader)
-        real_image = real_image.to(device)
-        current_batch_size = real_image.size(0)
-        noise = torch.Tensor(current_batch_size, nz).normal_(0, 1).to(device)
 
-        fake_images = netG(noise)
 
-        real_image = DiffAugment(real_image, policy=policy)
-        fake_images = [DiffAugment(fake, policy=policy) for fake in fake_images]
-        
-        ## 2. train Discriminator
-        netD.zero_grad()
 
-        err_dr, rec_img_all, rec_img_small, rec_img_part = train_d(netD, real_image, label="real")
-        train_d(netD, [fi.detach() for fi in fake_images], label="fake")
-        optimizerD.step()
-        
-        ## 3. train Generator
-        netG.zero_grad()
-        pred_g = netD(fake_images, "fake")
-        err_g = -pred_g.mean()
 
-        err_g.backward()
-        optimizerG.step()
 
-        for p, avg_p in zip(netG.parameters(), avg_param_G):
-            avg_p.mul_(0.999).add_(0.001 * p.data)
 
-        if iteration % 100 == 0:
-            print("GAN: loss d: %.5f    loss g: %.5f"%(err_dr, -err_g.item()))
-          
-        if iteration % (save_interval*10) == 0:
-            backup_para = copy_G_params(netG)
-            load_params(netG, avg_param_G)
-            with torch.no_grad():
-                vutils.save_image(netG(fixed_noise)[0].add(1).mul(0.5), saved_image_folder+'/%d.jpg'%iteration, nrow=4)
-                vutils.save_image( torch.cat([
-                        F.interpolate(real_image, 128), 
-                        rec_img_all, rec_img_small,
-                        rec_img_part]).add(1).mul(0.5), saved_image_folder+'/rec_%d.jpg'%iteration )
-            load_params(netG, backup_para)
+if __name__ == '__main__':
+    print("CONDITIONAL TRAINING:",config.CONDITIONAL_TRAINING)
+    if torch.cuda.is_available():   print("Using GPU")
+    else:                           print("No GPU")
+    create_dir_list = ["saved_model_weights","saved_images","saved_recs"]
+    for dir in create_dir_list:
+        if not os.path.exists(dir):
+            os.makedirs(dir)
 
-        if iteration % (save_interval*50) == 0 or iteration == total_iterations:
-            backup_para = copy_G_params(netG)
-            load_params(netG, avg_param_G)
-            torch.save({'g':netG.state_dict(),'d':netD.state_dict()}, saved_model_folder+'/%d.pth'%iteration)
-            load_params(netG, backup_para)
-            torch.save({'g':netG.state_dict(),
-                        'd':netD.state_dict(),
-                        'g_ema': avg_param_G,
-                        'opt_g': optimizerG.state_dict(),
-                        'opt_d': optimizerD.state_dict()}, saved_model_folder+'/all_%d.pth'%iteration)
+    world_size = config.NUM_GPU
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='region gan')
-
-    parser.add_argument('--path', type=str, default='../lmdbs/art_landscape_1k', help='path of resource dataset, should be a folder that has one or many sub image folders inside')
-    parser.add_argument('--output_path', type=str, default='./', help='Output path for the train results')
-    parser.add_argument('--cuda', type=int, default=0, help='index of gpu to use')
-    parser.add_argument('--name', type=str, default='test1', help='experiment name')
-    parser.add_argument('--iter', type=int, default=50000, help='number of iterations')
-    parser.add_argument('--start_iter', type=int, default=0, help='the iteration to start training')
-    parser.add_argument('--batch_size', type=int, default=8, help='mini batch number of images')
-    parser.add_argument('--im_size', type=int, default=1024, help='image resolution')
-    parser.add_argument('--ckpt', type=str, default='None', help='checkpoint weight path if have one')
-    parser.add_argument('--workers', type=int, default=2, help='number of workers for dataloader')
-    parser.add_argument('--save_interval', type=int, default=100, help='number of iterations to save model')
-
-    args = parser.parse_args()
-    print(args)
-
-    train(args)
+    mp.spawn(main, args=(world_size,), nprocs=world_size)
