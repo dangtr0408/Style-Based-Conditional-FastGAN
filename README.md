@@ -5,9 +5,9 @@ What's new:
 
 How to train:
 
-'''batch
+```batch
 python train.py --inf
-'''
+```
 You can enable conditional training anytime by adding "--cond".
 
 Ongoing project...
