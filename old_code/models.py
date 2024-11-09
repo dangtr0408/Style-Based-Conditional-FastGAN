@@ -367,3 +367,78 @@ class Generator(nn.Module):
             
         feat_1024       = self.feat_1024(feat_512, mapped)
         return torch.tanh(self.conv_rgb(feat_1024))
+    
+
+
+class Discriminator(nn.Module):
+    def __init__(self, ndf=64, nc=3, im_size=512):
+        super(Discriminator, self).__init__()
+        self.ndf = ndf
+        self.im_size = im_size
+
+        nfc_multi = {4:16, 8:8, 16:4, 32:2, 64:1, 128:0.5, 256:0.25, 512:0.125}
+        nfc = {}
+        for k, v in nfc_multi.items():
+            nfc[k] = int(v*ndf)
+
+        minibatch_std_offset = 1
+            
+        if im_size == 1024:
+            self.down_from_big = nn.Sequential( DownBlockComp(nc, nfc[512]),
+                                                DownBlockComp(nfc[512], nfc[256]))
+        elif im_size == 512:
+            self.down_from_big = nn.Sequential( DownBlockComp(nc, nfc[256]))
+        elif im_size == 256:
+            self.down_from_big = nn.Sequential( conv2d(nc, nfc[256], 3, 1, 1),
+                                                nn.LeakyReLU(0.2, inplace=True),)
+
+        self.down_4  = DownBlockComp(nfc[256],nfc[128])
+        self.down_8  = DownBlockComp(nfc[128],nfc[64])
+        self.down_16 = DownBlockComp(nfc[64] ,nfc[32])
+        self.down_32 = DownBlockComp(nfc[32] ,nfc[16])
+        self.down_64 = DownBlockComp(nfc[16] ,nfc[8])
+
+        self.out = nn.Sequential(conv2d(nfc[8]+minibatch_std_offset , nfc[4], 1, 1, 0), 
+                                    nn.LeakyReLU(0.2, inplace=True),
+                                    conv2d(nfc[4], 20, 4, 1, 0), 
+                                    nn.LeakyReLU(0.2, inplace=True),
+                                    nn.Flatten(start_dim=1),
+                                    linear(500, 100),
+                                    nn.LeakyReLU(0.2, inplace=True),
+                                    linear(100, 1))
+
+        self.decoder_big = SimpleDecoder(nfc[8], nc)
+        self.decoder_part = SimpleDecoder(nfc[16], nc)
+
+    def minibatch_std(self, x):
+        batch_statistics = torch.std(x, dim=0).mean().repeat(x.shape[0], 1, x.shape[2], x.shape[3])
+        return torch.cat([x, batch_statistics], dim=1)
+        
+    def forward(self, imgs, get_aux=False):
+        feat_2          = self.down_from_big(imgs)
+        
+        feat_4          = self.down_4(feat_2)
+
+        feat_8          = self.down_8(feat_4)
+        
+        feat_16         = self.down_16(feat_8)
+
+        feat_32         = self.down_32(feat_16)
+        
+        feat_last       = self.down_64(feat_32)
+
+        feat_last_stats = self.minibatch_std(feat_last)
+
+        out = self.out(feat_last_stats).view(-1)
+
+        if get_aux:
+            rec_img_big = self.decoder_big(feat_last)
+
+            part = torch.randint(0, 4, (1,)).item()
+            if part==0: rec_img_part        = self.decoder_part(feat_32[:,:,:8,:8])
+            if part==1: rec_img_part        = self.decoder_part(feat_32[:,:,:8,8:])
+            if part==2: rec_img_part        = self.decoder_part(feat_32[:,:,8:,:8])
+            if part==3: rec_img_part        = self.decoder_part(feat_32[:,:,8:,8:])
+            return out, part, [rec_img_big, rec_img_part]
+        
+        return out

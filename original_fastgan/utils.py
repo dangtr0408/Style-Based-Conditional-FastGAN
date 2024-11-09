@@ -6,7 +6,6 @@ import torch
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 from copy import deepcopy
-
 import config
 
 #Utils
@@ -56,8 +55,7 @@ def get_truncated_noise(shape, truncation):
 def get_noise():
     return torch.Tensor(config.BATCH_SIZE, config.Z_DIM).normal_(0, 1).to(config.DEVICE)
 
-def generate_examples(gen, iter, dir=None, n=0, batch_size=1, trunc=2, nrow=0, seed=None, cus_name=None, isEpoch=False):
-    gen.eval()
+def generate_examples(gen, iter, dir=None, n=0, batch_size=1, trunc=2, nrow=0, seed=None, cus_name=None, c_in=None, isEpoch=False):
     if dir is None:
         if isEpoch: dir = f"./saved_epoch_images/epoch_{iter}"
         else: dir = f"./saved_images/iter_{iter}"
@@ -65,22 +63,29 @@ def generate_examples(gen, iter, dir=None, n=0, batch_size=1, trunc=2, nrow=0, s
         os.makedirs(dir)
     for i in range(n+1):
         with torch.no_grad():
-            if seed is not None :
-                my_seed = torch.Generator().manual_seed(seed)
-                noise = torch.FloatTensor(batch_size, config.Z_DIM).normal_(0, 1, generator=my_seed).to(config.DEVICE)
+            if seed is not None : noise = torch.FloatTensor(batch_size, config.Z_DIM).normal_(0, 1, generator=torch.manual_seed(seed)).to(config.DEVICE)
             else: noise = get_truncated_noise((batch_size, config.Z_DIM), trunc).to(config.DEVICE)
                 
-            img = gen(noise)*0.5+0.5
+            img = gen(noise, c_in)*0.5+0.5
             filename = f"/{cus_name}.png" if cus_name else f"/img_{i}.png"
             if nrow == 0: save_image(img, dir + filename)
             else        : save_image(img, dir + filename, nrow=nrow)
-    gen.train()
-
 def blur_schedule(img, blur_sigma, kernel=5):
     blur_size = np.floor(blur_sigma * 3)
     if blur_size > 0:
         img = transforms.GaussianBlur(kernel, blur_sigma)(img)
     return img.to(config.DEVICE)
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        try:
+            m.weight.data.normal_(0.0, 0.02)
+        except:
+            pass
+    elif classname.find('BatchNorm') != -1:
+        m.weight.data.normal_(1.0, 0.02)
+        m.bias.data.fill_(0)
 
 def save_model(epoch, gen, gen_ema, critic, opt_gen, opt_critic, dir):
     checkpoint = {

@@ -10,7 +10,9 @@ import argparse
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
+from torchvision.utils import save_image
 from copy import deepcopy
+from pytorch_msssim import SSIM
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -18,8 +20,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from multiprocessing import current_process
 
 import config
-from models import Generator
-from pg_modules.discriminator import ProjectedDiscriminator
+from models import Generator, Discriminator
 from dataloader import DATASET, Multi_DataLoader
 from diffaug import DiffAugment
 from utils import *
@@ -76,16 +77,19 @@ def Multi_GPU_Setup(rank, world_size):
 
 #--------------------TRAIN FUNCTION--------------------
 
-def train_fn(critic, gen, gen_ema,
+def train_fn(critic, gen, gen_ema, rec_ssim,
              loader, policy,
              opt_critic, opt_gen,
              total_images_processed, epoch,
              blur_init_sigma=2, blur_fade_kimg=100, 
-             n_critic_updates=1, ema_decay=0.999):
+             n_critic_updates=1, lazy_reg=16, ema_decay=0.999):
     current = current_process()
     loop = tqdm(loader, leave=True, position=current._identity[0] - 1, initial=args.start_iter)
     cum_l_critic = 0
     cum_l_gen    = 0
+    cum_gp       = 0
+    cum_l_rec    = 0
+    t1           = 10*lazy_reg  #Gradient penalty multiplier
 
     for batch_idx, (real, c) in enumerate(loop):
         batch_idx += args.start_iter
@@ -110,19 +114,43 @@ def train_fn(critic, gen, gen_ema,
 
             #Fake loss
             critic_fake   = critic(blur_schedule(fake_image.detach(), blur_sigma))#
-            l_critic_fake = torch.mean(F.relu(torch.rand_like(critic_fake) * 0.2 + 0.8 + critic_fake))
+            l_critic_fake = torch.mean(F.softplus(critic_fake))
+
             l_critic_fake.backward()
             
-            #Real loss
-            critic_real = critic(blur_schedule(real_image, blur_sigma))
-            l_critic_real =  torch.mean(F.relu(torch.rand_like(critic_real) * 0.2 + 0.8 - critic_real))                                                                            
-            l_critic_real.backward()
+            #Lazy reg
+            if batch_idx % lazy_reg == 0 and i+1 == n_critic_updates:
+                real_image.requires_grad_()
+                critic_real, part, [rec_all, rec_part] = critic(blur_schedule(real_image, blur_sigma), get_aux=True)#
+                #Gradient penalty
+                gradients,    = torch.autograd.grad(outputs=critic_real,
+                                                    inputs=real_image,
+                                                    grad_outputs=critic_real.new_ones(critic_real.shape),
+                                                    create_graph=True)
+                gradient_penalty = gradients.reshape(cur_batch_size, -1).norm(2, dim=-1).pow(2).mean() * t1
+            else:
+                critic_real, part, [rec_all, rec_part] = critic(blur_schedule(real_image, blur_sigma), get_aux=True)#
+                gradient_penalty = torch.zeros(1,device=config.DEVICE)
+            
+            #Reconstruction loss
+            norm_rec_all     = (rec_all+ 1) / 2 #ssim loss requires img in range 0,1
+            norm_rec_part    = (rec_part+ 1) / 2
+            real_lowres      = (F.interpolate(real_image, rec_all.shape[2])+ 1) / 2
+            real_lowres_crop = (F.interpolate(crop_image_by_part(real_image, part), rec_part.shape[2])+ 1) / 2
 
+            l_rec =  1-rec_ssim(norm_rec_part, real_lowres_crop)    + 1-rec_ssim(norm_rec_all, real_lowres)
+            
+            #Real loss
+            l_critic_real =  torch.mean(F.softplus(-critic_real)) +\
+                             l_rec                                +\
+                             gradient_penalty                                                     
+                                                                                           
+            l_critic_real.backward()
             opt_critic.step()
 
         #Train gen
         critic_fake = critic(blur_schedule(fake_image, blur_sigma))#
-        l_gen       = -torch.mean(critic_fake)
+        l_gen       =  torch.mean(F.softplus(-critic_fake))
 
         l_gen.backward()
         opt_gen.step()
@@ -138,26 +166,40 @@ def train_fn(critic, gen, gen_ema,
                 update_average(gen, gen_ema, beta=0)#swap true params to avg params
                 generate_examples(gen, batch_idx, seed=482002, batch_size=8, nrow=4, cus_name=f'img_{batch_idx}', dir='./saved_images/')
                 load_params(gen, true_params)#back to true params
+                save_image( torch.cat([
+                            F.interpolate(real_image, rec_all.shape[-1]),
+                            rec_all,
+                            rec_part], dim=2)[:8].add(1).mul(0.5),
+                            f'./saved_recs/rec_{batch_idx}.jpg')
             if config.DEVICE == config.MASTER_DEVICE and config.SAVE_MODEL and batch_idx % config.SNAP_ITER == 0 and batch_idx != 0:
                 save_model(epoch, gen, gen_ema, critic, opt_gen, opt_critic, dir=f'./saved_model_weights/checkpoint_fastgan_iter_{batch_idx}.pt')
         else:
-            if config.DEVICE == config.MASTER_DEVICE and batch_idx % 200 == 0:
-                #true_params = get_copy_params(gen)
-                #update_average(gen, gen_ema, beta=0)#swap true params to avg params
+            if config.DEVICE == config.MASTER_DEVICE and batch_idx % 500 == 0:
+                true_params = get_copy_params(gen)
+                update_average(gen, gen_ema, beta=0)#swap true params to avg params
                 generate_examples(gen, batch_idx, n=16)
-                #load_params(gen, true_params)#back to true params
+                load_params(gen, true_params)#back to true params
+                save_image( torch.cat([
+                            F.interpolate(real_image, rec_all.shape[-1]),
+                            rec_all,
+                            rec_part], dim=2)[:8].add(1).mul(0.5),
+                            f'./saved_recs/rec_{batch_idx}.jpg')
                 
         if config.DEVICE == config.MASTER_DEVICE and config.SAVE_MODEL and (batch_idx+1) % config.SNAP == 0:
             save_model(epoch, gen, gen_ema, critic, opt_gen, opt_critic, dir='./saved_model_weights/checkpoint_fastgan.pt')
 
         #Display losses
-        l_critic = l_critic_fake + l_critic_real
+        l_critic = l_critic_fake + (l_critic_real-l_rec-gradient_penalty)
         cum_l_critic     += l_critic.item()
         cum_l_gen        += l_gen.item()
+        cum_l_rec        += l_rec.item()
+        cum_gp           += gradient_penalty.item()
         
         loop.set_postfix(OrderedDict([
             ('l_gen', cum_l_gen/(batch_idx-args.start_iter+1)),
-            ('l_critic', cum_l_critic/(batch_idx-args.start_iter+1))
+            ('l_critic', cum_l_critic/(batch_idx-args.start_iter+1)),
+            ('l_rec', cum_l_rec/(batch_idx-args.start_iter+1)),
+            ('gp', cum_gp/(batch_idx-args.start_iter+1)),
         ]))
 
 #--------------------MAIN--------------------
@@ -174,14 +216,15 @@ def main(rank, world_size):
     data_size   = data.__len__()
 
     gen                 = Generator(ngf=64, z_dim=config.Z_DIM, im_size=config.IMG_SIZE).to(config.DEVICE)
-    critic              = ProjectedDiscriminator(backbone_kwargs={"num_discs":4,"proj_type":2,"cond":False,"separable":False,"patch":False}).to(config.DEVICE)
-    critic.feature_network.requires_grad_(False)
+    critic              = Discriminator(ndf=64, im_size=config.IMG_SIZE).to(config.DEVICE)
 
-    opt_gen    = optim.Adam(gen.parameters(), lr=config.LEARNING_RATE_GENERATOR, betas=(0., 0.99), eps=1e-8)
-    opt_critic = optim.Adam(critic.parameters(), lr=config.LEARNING_RATE_CRITIC, betas=(0., 0.99), eps=1e-8)
+    opt_gen    = optim.Adam(gen.parameters(), lr=config.LEARNING_RATE_GENERATOR, betas=(0.5, 0.999), eps=1e-8)
+    opt_critic = optim.Adam(critic.parameters(), lr=config.LEARNING_RATE_CRITIC, betas=(0.5, 0.999), eps=1e-8)
+
+    rec_ssim = SSIM(win_size=11, win_sigma=1.5, data_range=1, size_average=True, channel=3)
 
     #Augmentation options
-    policy = ['color','cutout','translation']#
+    policy = ['color', 'cutout', 'translation']#, 'offset_h'
     
     gen     = DDP(gen, device_ids=[rank], output_device=rank, find_unused_parameters=True)
     critic  = DDP(critic, device_ids=[rank], output_device=rank, find_unused_parameters=True)
@@ -237,7 +280,7 @@ def main(rank, world_size):
             loader.sampler.set_epoch(epoch)
         total_images_processed = (epoch-1)*data_size
 
-        train_fn(critic, gen, gen_ema,
+        train_fn(critic, gen, gen_ema, rec_ssim,
                 loader, policy,
                 opt_critic, opt_gen,
                 total_images_processed, epoch, 
@@ -262,7 +305,7 @@ if __name__ == '__main__':
     print("CONDITIONAL TRAINING:",config.CONDITIONAL_TRAINING)
     if torch.cuda.is_available():   print("Using GPU")
     else:                           print("No GPU")
-    create_dir_list = ["saved_model_weights","saved_images"]
+    create_dir_list = ["saved_model_weights","saved_images","saved_recs"]
     for dir in create_dir_list:
         if not os.path.exists(dir):
             os.makedirs(dir)

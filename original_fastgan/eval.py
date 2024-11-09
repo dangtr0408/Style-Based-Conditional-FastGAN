@@ -10,9 +10,8 @@ import os
 import random
 import argparse
 from tqdm import tqdm
-import re
 
-from models import Generator
+from model import Generator
 
 
 def load_params(model, new_param):
@@ -22,9 +21,6 @@ def load_params(model, new_param):
 def resize(img,size=256):
     return F.interpolate(img, size=size)
 
-def extract_number(filename):
-    match = re.search(r'(\d+)', filename)
-    return int(match.group(1)) if match else -1
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -32,41 +28,43 @@ if __name__ == "__main__":
     )
     parser.add_argument('--ckpt', type=str)
     parser.add_argument('--cuda', type=int, default=0, help='index of gpu to use')
+    parser.add_argument('--start_iter', type=int, default=1)
+    parser.add_argument('--end_iter', type=int, default=4)
 
     parser.add_argument('--dist', type=str, default='./eval_images')
     parser.add_argument('--size', type=int, default=256)
-    parser.add_argument('--batch', default=64, type=int, help='batch size')
-    parser.add_argument('--n_sample', type=int, default=10000)
+    parser.add_argument('--batch', default=16, type=int, help='batch size')
+    parser.add_argument('--n_sample', type=int, default=2000)
     parser.add_argument('--big', action='store_true')
-    parser.add_argument('--im_size', type=int, default=256)
+    parser.add_argument('--im_size', type=int, default=512)
+    parser.add_argument('--multiplier', type=int, default=5000, help='multiplier for model number')
     parser.set_defaults(big=False)
     args = parser.parse_args()
     
     if not os.path.exists(args.dist):
         os.makedirs(args.dist)
 
-    noise_dim = 128
+    noise_dim = 256
     device = torch.device('cuda:%d'%(args.cuda))
     
-    net_ig = Generator( ngf=64, z_dim=noise_dim, nc=3, im_size=args.im_size)
+    net_ig = Generator( ngf=64, nz=noise_dim, nc=3, im_size=args.im_size)#, big=args.big )
     net_ig.to(device)
 
-    checkpoint_dir = f"./saved_model_weights/"
-    n=0
-    for i, filename in enumerate(sorted(os.listdir(checkpoint_dir), key=extract_number)[n:]):#start from n checkpoint
-        checkpoint = torch.load(checkpoint_dir+filename, map_location=lambda a,b: a)
-        checkpoint['gen_ema'] = {k.replace('module.', ''): v for k, v in checkpoint['gen'].items()}
-        net_ig.load_state_dict(checkpoint['gen_ema'], strict=False)
+    for n in [args.multiplier*i for i in range(args.start_iter, args.end_iter+1)]:
+        ckpt = f"./saved_model_weights/checkpoint_fastgan_iter_{n}.pt"
+        checkpoint = torch.load(ckpt, map_location=lambda a,b: a)
+        checkpoint['gen'] = {k.replace('module.', ''): v for k, v in checkpoint['gen'].items()}
+        net_ig.load_state_dict(checkpoint['gen'])
         #load_params(net_ig, checkpoint['g_ema'])
 
         #net_ig.eval()
-        print(f'loaded checkpoint {filename}')
+        print('load checkpoint success, iter %d'%n)
 
         net_ig.to(device)
 
         del checkpoint
 
-        dist = f'./{args.dist}/eval_{filename}'
+        dist = f'./{args.dist}/eval_%d'%(n)
         dist = os.path.join(dist, 'img')
         os.makedirs(dist, exist_ok=True)
 
