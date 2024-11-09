@@ -2,8 +2,8 @@ Ongoing project...
 
 What's new:
 - Added style-based learning using a mapping network and AdaIN, similar to StyleGAN1.
-- Added conditional training by modifying the SLE layers.
-- Switched to PyTorch DDP.
+- Wavelets extraction for high freq features.
+- Support Projected GAN and PyTorch DDP.
 
 Before training make sure your image folders are in the following format:
 
@@ -22,4 +22,3 @@ How to train:
 ```batch
 python train.py --dir D:\YourDir\YourFolder --n_gpus 1 --im_size 512 --batch_size 8 --inf
 ```
-You can enable conditional training anytime by adding "--cond".
