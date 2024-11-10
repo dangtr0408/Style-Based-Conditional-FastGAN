@@ -2,6 +2,7 @@ Developing this project has greatly expanded my knowledge in both academic resea
 
 Note:
 - The goal of this project is to create a generator that is fast to train yet efficient to invert (see GAN inversion papers for more details).
+- I removed the conditional option later in the project to focus on improving the model's image quality.
 - This implementation achieves an FID of 42.5 for art paintings (1k images) at a resolution of 256x256.
 
 Highlight features:
