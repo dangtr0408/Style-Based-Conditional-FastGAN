@@ -15,9 +15,9 @@ Before training make sure your image folders are in the following format:
 
 ```
 images_folder
-├── cat_images  (class1)
-├── dog_images  (class2)
-├── bird_images (class3)
+├── cat_folder  (class1)
+├── dog_folder  (class2)
+├── bird_folder (class3)
 └── ...         (class n)
 ```
 
