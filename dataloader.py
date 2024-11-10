@@ -5,7 +5,6 @@ from PIL import ImageOps
 
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
-import itertools
 
 import torchvision.transforms as transforms
 from torchsampler import ImbalancedDatasetSampler
@@ -17,8 +16,9 @@ import config
 #Dataloader
 
 def cycle(iterable):
-    for item in itertools.cycle(iterable):
-        yield item
+    while True:
+        for item in iterable:
+            yield item
 
 def Multi_DataLoader(input_dataset, rank, world_size, batch_size=32, shuffle=False, pin_memory=False, num_workers=0):
     sampler = ImbalancedDatasetSampler(input_dataset)
